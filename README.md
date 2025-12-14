@@ -1,34 +1,47 @@
-// mobile_app/lib/services/tax_engine_service.dart
-import '../models/pos_model.dart';
+// mobile_app/lib/services/inventory_manager.dart (Обновление)
+// ... (импорты) ...
 
-class TaxEngineService {
-  // Налоговые ставки по классу (имитация сложной системы)
-  static const Map<TaxClass, double> _taxRates = {
-    TaxClass.standard: 0.10, // 10%
-    TaxClass.food: 0.07,     // 7%
-    TaxClass.digital: 0.05,  // 5%
-    TaxClass.zeroRated: 0.0, // 0%
-  };
+class InventoryManager {
+  final Map<String, int> _stock = {'SKU001': 50, 'SKU002': 5, 'SKU003': 100};
+  final Map<String, int> _reservedStock = {}; 
 
-  // Правило TAX-001: Расчет налога
-  double calculateTax(List<LineItem> items, Customer? customer, String storeLocation) {
-    double totalTaxableAmount = 0.0;
-    
-    // Если клиент освобожден от налога (например, опт)
-    if (customer != null && customer.isTaxExempt) {
-      return 0.0;
+  // --- Улучшение: Метод для РЕЗЕРВИРОВАНИЯ (Optimistic Locking) ---
+  // Мы резервируем в локальном чеке, полагаясь, что запасы есть.
+  // Финальная проверка (Commit) произойдет при оплате.
+  double reserveStock(String sku, int quantity) {
+    if (!checkAvailability(sku, quantity)) {
+      // Даже если нет 100% гарантии, мы позволяем добавить (с предупреждением)
+      print('INVENTORY WARNING: Товар $sku может отсутствовать.');
     }
+    _reservedStock[sku] = (_reservedStock[sku] ?? 0) + quantity;
+    // Возвращаем текущий общий запас для записи в LineItem
+    return (_stock[sku] ?? 0).toDouble(); 
+  }
+  
+  // Правило INV-004: Финальная проверка перед списанием
+  Future<bool> commitTransaction(List<LineItem> items) async {
+    // В реальном приложении: отправка на бэкенд, который проверяет:
+    // 1. Не изменился ли глобальный запас с момента резервирования (reservedStockAtTime).
+    // 2. Достаточно ли остатков для списания.
     
     for (var item in items) {
-      final rate = _taxRates[item.product.taxClass] ?? _taxRates[TaxClass.standard]!;
-      
-      // Налог применяется к сумме ПОСЛЕ скидок
-      totalTaxableAmount += item.totalAfterDiscount * rate;
+      if (item.product.requiresInventoryTracking) {
+        final currentStock = _stock[item.product.sku] ?? 0;
+        if (currentStock < item.quantity) {
+          print('INVENTORY ABORT: Недостаточно $item.product.sku для списания.');
+          return false; // Сбой транзакции!
+        }
+        // Списание (имитация)
+        _stock[item.product.sku] = currentStock - item.quantity;
+        _reservedStock.remove(item.product.sku);
+      }
     }
-    
-    // В реальном приложении: корректировка ставки налога в зависимости от storeLocation
-    // if (storeLocation == 'NewYork') totalTaxableAmount *= 1.01;
-    
-    return totalTaxableAmount;
+    print('INVENTORY: Списание успешно подтверждено (COMMIT).');
+    return true;
+  }
+  
+  bool checkAvailability(String sku, int quantityNeeded) {
+    final available = (_stock[sku] ?? 0) - (_reservedStock[sku] ?? 0);
+    return available >= quantityNeeded;
   }
 }
