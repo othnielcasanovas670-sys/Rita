@@ -1,47 +1,103 @@
-// mobile_app/lib/services/inventory_manager.dart (Обновление)
+// mobile_app/lib/providers/cart_provider.dart (Обновление)
 // ... (импорты) ...
+import '../services/tax_engine_service.dart';
 
-class InventoryManager {
-  final Map<String, int> _stock = {'SKU001': 50, 'SKU002': 5, 'SKU003': 100};
-  final Map<String, int> _reservedStock = {}; 
+final taxEngineService = Provider((ref) => TaxEngineService());
 
-  // --- Улучшение: Метод для РЕЗЕРВИРОВАНИЯ (Optimistic Locking) ---
-  // Мы резервируем в локальном чеке, полагаясь, что запасы есть.
-  // Финальная проверка (Commit) произойдет при оплате.
-  double reserveStock(String sku, int quantity) {
-    if (!checkAvailability(sku, quantity)) {
-      // Даже если нет 100% гарантии, мы позволяем добавить (с предупреждением)
-      print('INVENTORY WARNING: Товар $sku может отсутствовать.');
-    }
-    _reservedStock[sku] = (_reservedStock[sku] ?? 0) + quantity;
-    // Возвращаем текущий общий запас для записи в LineItem
-    return (_stock[sku] ?? 0).toDouble(); 
+class CartState {
+  // ... (предыдущие поля) ...
+  final Customer? currentCustomer; // Привязанный покупатель
+
+  CartState({
+    this.items = const [], 
+    this.appliedCoupon,
+    this.currentCustomer // Новый параметр
+  });
+  
+  // Пересчет налогов должен быть динамическим
+  double calculateTax(TaxEngineService taxService, String storeLocation) {
+    return taxService.calculateTax(items, currentCustomer, storeLocation);
+  }
+
+  // Обновляем copyWith
+  CartState copyWith({List<LineItem>? items, String? appliedCoupon, Customer? currentCustomer}) {
+    return CartState(
+      items: items ?? this.items, 
+      appliedCoupon: appliedCoupon ?? this.appliedCoupon,
+      currentCustomer: currentCustomer ?? this.currentCustomer,
+    );
+  }
+}
+
+class CartNotifier extends StateNotifier<CartState> {
+  // ... (предыдущие поля) ...
+  final String _storeLocation = 'KYIV-STORE-001'; // Местоположение для налога
+
+  // ... (addItem - остается похожим, но использует Customer) ...
+
+  void attachCustomer(Customer customer) {
+    // Привязка клиента вызывает пересчет скидок (для Лояльности)
+    _updateCartWithDiscounts(state.items, state.appliedCoupon, customer);
+    state = state.copyWith(currentCustomer: customer);
+    _ref.read(auditService).logAction(AuditAction.discountApplied, _currentUserId, 'Привязан клиент ${customer.name}');
   }
   
-  // Правило INV-004: Финальная проверка перед списанием
-  Future<bool> commitTransaction(List<LineItem> items) async {
-    // В реальном приложении: отправка на бэкенд, который проверяет:
-    // 1. Не изменился ли глобальный запас с момента резервирования (reservedStockAtTime).
-    // 2. Достаточно ли остатков для списания.
+  // --- Обновленный метод пересчета ---
+  void _updateCartWithDiscounts(List<LineItem> currentItems, String? coupon, Customer? customer) {
+    final discountService = _ref.read(discountService);
+    final appliedRules = discountService.applyDiscounts(currentItems, coupon, customer);
     
-    for (var item in items) {
-      if (item.product.requiresInventoryTracking) {
-        final currentStock = _stock[item.product.sku] ?? 0;
-        if (currentStock < item.quantity) {
-          print('INVENTORY ABORT: Недостаточно $item.product.sku для списания.');
-          return false; // Сбой транзакции!
-        }
-        // Списание (имитация)
-        _stock[item.product.sku] = currentStock - item.quantity;
-        _reservedStock.remove(item.product.sku);
-      }
-    }
-    print('INVENTORY: Списание успешно подтверждено (COMMIT).');
-    return true;
+    final updatedItems = currentItems.map((item) {
+      final discounts = appliedRules[item.lineId] ?? [];
+      // В реальном коде: здесь LineItem должен быть скопирован с новыми скидками
+      return LineItem(
+        product: item.product,
+        quantity: item.quantity,
+        priceOverride: item.priceOverride,
+        appliedDiscounts: discounts,
+        reservedStockAtTime: item.reservedStockAtTime,
+      );
+    }).toList();
+    
+    state = state.copyWith(items: updatedItems);
   }
-  
-  bool checkAvailability(String sku, int quantityNeeded) {
-    final available = (_stock[sku] ?? 0) - (_reservedStock[sku] ?? 0);
-    return available >= quantityNeeded;
+
+  // --- Финализация и оплата (Обновлено для Inventory Commit и Лояльности) ---
+  Future<Transaction> finalizeTransaction(String paymentMethod) async {
+    // 1. Финальная проверка и COMMIT Inventory
+    final inventoryCommitSuccess = await _ref.read(inventoryManagerProvider).commitTransaction(state.items);
+    if (!inventoryCommitSuccess) {
+      _ref.read(auditService).logAction(AuditAction.transactionCompleted, _currentUserId, 'Транзакция ОТМЕНЕНА: Сбой инвентаризации');
+      throw Exception('Ошибка: Недостаточно товара на складе.');
+    }
+    
+    // 2. Расчет Лояльности
+    final pointsEarned = state.currentCustomer != null ? (state.netTotal / 10).round() : 0; // 1 балл за каждые 10 у.е.
+    final taxService = _ref.read(taxEngineService);
+    final tax = taxService.calculateTax(state.items, state.currentCustomer, _storeLocation);
+
+    final transaction = Transaction(
+      transactionId: 'TX-${Random().nextInt(99999)}',
+      timestamp: DateTime.now(),
+      items: state.items,
+      subtotal: state.subtotal,
+      discountTotal: state.totalDiscount,
+      taxAmount: tax,
+      grandTotal: state.netTotal + tax,
+      status: TransactionStatus.completed,
+      cashHandlerId: _currentUserId,
+      customer: state.currentCustomer,
+      pointsEarned: pointsEarned.toDouble(),
+      pointsRedeemed: 0, // Усложнение: здесь могла быть логика списания баллов
+    );
+    
+    // 3. Обновление баллов клиента (имитация)
+    if (state.currentCustomer != null) {
+        state.currentCustomer!.copyWith(loyaltyPoints: state.currentCustomer!.loyaltyPoints + pointsEarned);
+    }
+
+    _ref.read(auditService).logAction(AuditAction.transactionCompleted, _currentUserId, 'Успешная транзакция ${transaction.transactionId}. Баллов заработано: $pointsEarned');
+    state = CartState();
+    return transaction;
   }
 }
